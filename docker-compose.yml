@@ -1,0 +1,14 @@
+services:
+  fetch-api:
+    build: .
+    restart: always
+    #network_mode: "host"
+    ports:
+      - "8026:8026"
+    volumes:
+      - ./fetch:/app/data/
+    #env_file:
+    #  - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=UTF-8

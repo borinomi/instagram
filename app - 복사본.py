@@ -42,12 +42,6 @@ class CommentRequest(BaseModel):
     code: Optional[str] = None           # 게시물 shortcode (referrer 용, 없어도 됨)
     max_loops: int = 50                  # 안전장치
 
-class ProfileRequest(BaseModel):
-    url: Optional[str] = None        # https://www.instagram.com/lg_uk/
-    id: Optional[str] = None         # user_id (50918045). 있으면 페이지 이동 생략 가능
-    username: Optional[str] = None   # 디버깅/로깅용
-
-
 # ───────────────────────────── Stealth ─────────────────────────────
 
 async def create_stealth_page(context):
@@ -69,32 +63,29 @@ QUERY_CACHE: dict[str, dict] = {}
 
 
 def _harvest_request(req):
+    """Playwright Request 객체를 받아 friendly_name 메타를 캐싱."""
     try:
         if req.method != "POST":
             return
-        # 두 엔드포인트 모두 잡기
-        if "/graphql/query" not in req.url and "/api/graphql" not in req.url:
+        if "/graphql/query" not in req.url:
             return
 
         friendly = req.headers.get("x-fb-friendly-name")
         root_field = req.headers.get("x-root-field-name")
 
         post_data = req.post_data or ""
+        # body 에 doc_id 가 들어있음
         parsed = parse_qs(post_data)
         doc_id = (parsed.get("doc_id") or [None])[0]
         if not friendly:
             friendly = (parsed.get("fb_api_req_friendly_name") or [None])[0]
 
-        # 어느 엔드포인트로 갔는지도 같이 저장
-        endpoint = "/api/graphql" if "/api/graphql" in req.url else "/graphql/query"
-
         if friendly and doc_id:
             QUERY_CACHE[friendly] = {
                 "doc_id": doc_id,
-                "root_field": root_field or "",
-                "endpoint": endpoint,
+                "root_field": root_field or "xdt_api__v1__feed__user_timeline_graphql_connection",
             }
-            print(f"[harvest] {friendly} → doc_id={doc_id} ep={endpoint} root_field={root_field}")
+            print(f"[harvest] {friendly} → doc_id={doc_id} root_field={root_field}")
     except Exception as e:
         print(f"[harvest] error: {e}")
 
@@ -169,12 +160,15 @@ def extract_username(url: str) -> str:
 # ───────────────────────────── Query 선택 ─────────────────────────────
 
 def find_query(kind: str) -> Optional[dict]:
+    """
+    kind:
+      "first" → friendly_name 에 "ProfilePosts" 포함 & "TabContent" 미포함
+      "next"  → friendly_name 에 "ProfilePostsTabContent" 포함
+    """
     for name, meta in QUERY_CACHE.items():
         if kind == "first" and "ProfilePosts" in name and "TabContent" not in name:
             return {"friendly_name": name, **meta}
         if kind == "next" and "ProfilePostsTabContent" in name:
-            return {"friendly_name": name, **meta}
-        if kind == "profile" and "ProfilePageContent" in name:
             return {"friendly_name": name, **meta}
     return None
 
@@ -198,7 +192,7 @@ async def wait_for_query(kind: str, timeout: float = 10.0) -> dict:
 # ───────────────────────────── GraphQL Fetch ─────────────────────────────
 
 GRAPHQL_JS = """
-async ({ doc_id, friendly_name, root_field, variables, endpoint }) => {
+async ({ doc_id, friendly_name, root_field, variables }) => {
     const html = document.documentElement.innerHTML;
 
     const pickFirst = (...regs) => {
@@ -242,21 +236,19 @@ async ({ doc_id, friendly_name, root_field, variables, endpoint }) => {
         doc_id
     });
 
-    const headers = {
-        "accept": "*/*",
-        "content-type": "application/x-www-form-urlencoded",
-        "x-csrftoken": csrftoken,
-        "x-fb-lsd": lsd,
-        "x-fb-friendly-name": friendly_name,
-        "x-ig-app-id": appId,
-        "x-asbd-id": "359341"
-    };
-    if (root_field) headers["x-root-field-name"] = root_field;
-
-    const res = await fetch(endpoint, {
+    const res = await fetch("/graphql/query", {
         method: "POST",
         credentials: "include",
-        headers: headers,
+        headers: {
+            "accept": "*/*",
+            "content-type": "application/x-www-form-urlencoded",
+            "x-csrftoken": csrftoken,
+            "x-fb-lsd": lsd,
+            "x-fb-friendly-name": friendly_name,
+            "x-ig-app-id": appId,
+            "x-root-field-name": root_field,
+            "x-asbd-id": "359341"
+        },
         body: body.toString()
     });
 
@@ -266,15 +258,13 @@ async ({ doc_id, friendly_name, root_field, variables, endpoint }) => {
 """
 
 
-async def run_graphql(page, *, friendly_name, doc_id, root_field, variables, endpoint="/graphql/query"):
+async def run_graphql(page, *, friendly_name, doc_id, root_field, variables):
     return await page.evaluate(GRAPHQL_JS, {
         "doc_id": doc_id,
         "friendly_name": friendly_name,
         "root_field": root_field,
         "variables": variables,
-        "endpoint": endpoint,
     })
-
 
 # ───────────────────────────── Comments Fetch JS ─────────────────────────────
 
@@ -378,34 +368,6 @@ async ({ pk, max_loops }) => {
 
 async def fetch_comments(page, pk: str, max_loops: int):
     return await page.evaluate(COMMENTS_JS, {"pk": pk, "max_loops": max_loops})
-
-USER_ID_JS = """
-({ username }) => {
-    const html = document.documentElement.innerHTML;
-    // 여러 패턴 시도 — 인스타 페이지 빌드마다 위치가 다를 수 있음
-    const patterns = [
-        // "profilePage_50918045" 같은 형태
-        new RegExp('"profilePage_(\\\\d+)"'),
-        // "owner":{"id":"50918045", ... ,"username":"lg_uk"}
-        new RegExp('"username":"' + username + '"[^}]{0,200}?"id":"(\\\\d+)"'),
-        new RegExp('"id":"(\\\\d+)"[^}]{0,200}?"username":"' + username + '"'),
-        // "user_id":"50918045"
-        /"user_id":"(\\d+)"/,
-        // "owner_id":"50918045"
-        /"owner_id":"(\\d+)"/
-    ];
-    for (const r of patterns) {
-        const m = html.match(r);
-        if (m) return m[1];
-    }
-    return null;
-}
-"""
-
-
-async def extract_user_id(page, username: str) -> Optional[str]:
-    return await page.evaluate(USER_ID_JS, {"username": username})
-
 
 
 # ───────────────────────────── Endpoints ─────────────────────────────
@@ -564,78 +526,6 @@ async def comment(req: CommentRequest):
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"success": False, "error": str(e), "timestamp": now_iso()}
-
-@app.post("/profile")
-async def profile(req: ProfileRequest):
-    try:
-        if not req.url and not req.id:
-            return {"success": False,
-                    "error": "either 'url' or 'id' is required",
-                    "timestamp": now_iso()}
-
-        async with app.state.lock:
-            page = await ensure_page()
-
-            user_id = req.id
-            username = req.username
-
-            # URL 이 들어왔으면 username 추출 + 필요 시 페이지 이동
-            if req.url:
-                username = extract_username(req.url) or username
-                if username and username not in page.url:
-                    await page.goto(req.url, wait_until="domcontentloaded")
-                    await asyncio.sleep(2)
-
-                # id 가 없으면 HTML 에서 추출
-                if not user_id and username:
-                    user_id = await extract_user_id(page, username)
-
-            # id 만 들어왔는데 페이지가 인스타가 아니면 일단 인스타로
-            if not req.url and "instagram.com" not in (page.url or ""):
-                await page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
-                await asyncio.sleep(1.5)
-
-            if not user_id:
-                return {"success": False,
-                        "error": f"user_id resolve failed (username={username})",
-                        "timestamp": now_iso()}
-
-            # 쿼리 메타 (인스타가 자동으로 보낸 요청에서 캐싱됨)
-            meta = await wait_for_query("profile", timeout=10)
-
-            variables = {
-                "enable_integrity_filters": True,
-                "id": user_id,
-                "__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider": True,
-                "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
-            }
-
-            result = await run_graphql(
-                page,
-                friendly_name=meta["friendly_name"],
-                doc_id=meta["doc_id"],
-                root_field=meta.get("root_field", ""),
-                variables=variables,
-                endpoint=meta.get("endpoint", "/api/graphql"),
-            )
-
-            print(f"[profile][id={user_id} username={username}] "
-                  f"status={result['status']} meta={meta} len={len(result['body'])}")
-            return {
-                "success": True,
-                "status": result["status"],
-                "user_id": user_id,
-                "username": username,
-                "meta": meta,
-                "data": result["body"],
-                "timestamp": now_iso(),
-            }
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return {"success": False, "error": str(e), "timestamp": now_iso()}
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8026)

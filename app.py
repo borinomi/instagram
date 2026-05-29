@@ -72,7 +72,6 @@ def _harvest_request(req):
     try:
         if req.method != "POST":
             return
-        # 두 엔드포인트 모두 잡기
         if "/graphql/query" not in req.url and "/api/graphql" not in req.url:
             return
 
@@ -82,10 +81,11 @@ def _harvest_request(req):
         post_data = req.post_data or ""
         parsed = parse_qs(post_data)
         doc_id = (parsed.get("doc_id") or [None])[0]
+        variables_raw = (parsed.get("variables") or [None])[0]  # ← 추가
+        
         if not friendly:
             friendly = (parsed.get("fb_api_req_friendly_name") or [None])[0]
 
-        # 어느 엔드포인트로 갔는지도 같이 저장
         endpoint = "/api/graphql" if "/api/graphql" in req.url else "/graphql/query"
 
         if friendly and doc_id:
@@ -93,6 +93,7 @@ def _harvest_request(req):
                 "doc_id": doc_id,
                 "root_field": root_field or "",
                 "endpoint": endpoint,
+                "variables_raw": variables_raw,  # ← 추가
             }
             print(f"[harvest] {friendly} → doc_id={doc_id} ep={endpoint} root_field={root_field}")
     except Exception as e:
@@ -423,24 +424,30 @@ async def fetch_new(req: ProfilePostsRequest):
 
             if username not in page.url:
                 await page.goto(req.url, wait_until="domcontentloaded")
-                # 페이지가 첫 페이지 GraphQL 을 자동으로 날릴 시간 확보
                 await asyncio.sleep(2)
 
-            # 페이지가 실제로 보낸 요청에서 메타 가져오기
             meta = await wait_for_query("first", timeout=10)
 
-            variables = {
-                "data": {
-                    "count": 12,
-                    "include_reel_media_seen_timestamp": True,
-                    "include_relationship_info": True,
-                    "latest_besties_reel_media": True,
-                    "latest_reel_media": True,
-                },
-                "username": username,
-                "__relay_internal__pv__PolarisImmersiveFeedChainingEnabledrelayprovider": True,
-                "__relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider": False,
-            }
+            # 인스타가 실제로 보낸 variables를 그대로 사용
+            if meta.get("variables_raw"):
+                variables = json.loads(meta["variables_raw"])
+                # username만 우리가 원하는 걸로 덮어쓰기 (다른 계정 조회용)
+                variables["username"] = username
+            else:
+                # 폴백
+                variables = {
+                    "data": {
+                        "count": 12,
+                        "include_reel_media_seen_timestamp": True,
+                        "include_relationship_info": True,
+                        "latest_besties_reel_media": True,
+                        "latest_reel_media": True,
+                    },
+                    "username": username,
+                    "__relay_internal__pv__PolarisImmersiveFeedChainingEnabledrelayprovider": True,
+                    "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
+                    "__relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider": False,
+                }
 
             result = await run_graphql(
                 page,
@@ -451,18 +458,18 @@ async def fetch_new(req: ProfilePostsRequest):
             )
 
             print(f"[fetch-new][{username}] status={result['status']} "
-                  f"meta={meta} len={len(result['body'])}")
+                  f"meta={meta['friendly_name']} len={len(result['body'])}")
+            
             return {
                 "success": True,
                 "status": result["status"],
-                "meta": meta,
+                "meta": {k: v for k, v in meta.items() if k != "variables_raw"},
                 "data": result["body"],
                 "timestamp": now_iso(),
             }
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"success": False, "error": str(e), "timestamp": now_iso()}
-
 
 @app.post("/fetch-next")
 async def fetch_next(req: ProfilePostsNextRequest):
@@ -485,22 +492,27 @@ async def fetch_next(req: ProfilePostsNextRequest):
 
             meta = await wait_for_query("next", timeout=10)
 
-            variables = {
-                "after": req.after,
-                "before": None,
-                "data": {
-                    "count": 12,
-                    "include_reel_media_seen_timestamp": True,
-                    "include_relationship_info": True,
-                    "latest_besties_reel_media": True,
-                    "latest_reel_media": True,
-                },
-                "first": 12,
-                "last": None,
-                "username": username,
-                "__relay_internal__pv__PolarisImmersiveFeedChainingEnabledrelayprovider": True,
-                "__relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider": False,
-            }
+            # 캐시된 variables 그대로 사용, after와 username만 덮어쓰기
+            if meta.get("variables_raw"):
+                variables = json.loads(meta["variables_raw"])
+                variables["after"] = req.after
+                variables["username"] = username
+            else:
+                # 폴백
+                variables = {
+                    "after": req.after,
+                    "before": None,
+                    "data": {
+                        "count": 12,
+                        "include_reel_media_seen_timestamp": True,
+                        "include_relationship_info": True,
+                        "latest_besties_reel_media": True,
+                        "latest_reel_media": True,
+                    },
+                    "first": 12,
+                    "last": None,
+                    "username": username,
+                }
 
             result = await run_graphql(
                 page,
@@ -511,12 +523,12 @@ async def fetch_next(req: ProfilePostsNextRequest):
             )
 
             print(f"[fetch-next][{username}] after={req.after[:20]}... "
-                  f"status={result['status']} meta={meta} "
+                  f"status={result['status']} meta={meta['friendly_name']} "
                   f"len={len(result['body'])}")
             return {
                 "success": True,
                 "status": result["status"],
-                "meta": meta,
+                "meta": {k: v for k, v in meta.items() if k != "variables_raw"},
                 "data": result["body"],
                 "timestamp": now_iso(),
             }
@@ -579,18 +591,15 @@ async def profile(req: ProfileRequest):
             user_id = req.id
             username = req.username
 
-            # URL 이 들어왔으면 username 추출 + 필요 시 페이지 이동
             if req.url:
                 username = extract_username(req.url) or username
                 if username and username not in page.url:
                     await page.goto(req.url, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
 
-                # id 가 없으면 HTML 에서 추출
                 if not user_id and username:
                     user_id = await extract_user_id(page, username)
 
-            # id 만 들어왔는데 페이지가 인스타가 아니면 일단 인스타로
             if not req.url and "instagram.com" not in (page.url or ""):
                 await page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
                 await asyncio.sleep(1.5)
@@ -600,17 +609,18 @@ async def profile(req: ProfileRequest):
                         "error": f"user_id resolve failed (username={username})",
                         "timestamp": now_iso()}
 
-            # 쿼리 메타 (인스타가 자동으로 보낸 요청에서 캐싱됨)
             meta = await wait_for_query("profile", timeout=10)
 
-            variables = {
-                "enable_integrity_filters": True,
-                "id": user_id,
-                "__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider": True,
-                "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
-            }
+            # 캐시된 variables 그대로 사용, id만 덮어쓰기
+            if meta.get("variables_raw"):
+                variables = json.loads(meta["variables_raw"])
+                variables["id"] = user_id
+            else:
+                # 폴백
+                variables = {
+                    "enable_integrity_filters": True,
+                    "id": user_id,
+                }
 
             result = await run_graphql(
                 page,
@@ -622,13 +632,14 @@ async def profile(req: ProfileRequest):
             )
 
             print(f"[profile][id={user_id} username={username}] "
-                  f"status={result['status']} meta={meta} len={len(result['body'])}")
+                  f"status={result['status']} meta={meta['friendly_name']} "
+                  f"len={len(result['body'])}")
             return {
                 "success": True,
                 "status": result["status"],
                 "user_id": user_id,
                 "username": username,
-                "meta": meta,
+                "meta": {k: v for k, v in meta.items() if k != "variables_raw"},
                 "data": result["body"],
                 "timestamp": now_iso(),
             }

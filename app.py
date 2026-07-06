@@ -694,9 +694,10 @@ PAGE_SIZE = 12
 
 
 def _parse_date_floor(date_str: str) -> int:
-    """'YYYY-MM-DD' → 당일 00:00:00 로컬 기준 unix timestamp(초). 당일 포함(>=)."""
     dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-    return int(dt.timestamp())
+    ts = int(dt.timestamp())
+    print(f"[date_floor] {date_str} → {ts}")
+    return ts
 
 
 def _extract_edges(body_str: str) -> list:
@@ -762,7 +763,12 @@ async def instagram(req: InstagramRequest):
 
             # 첫 페이지 처리
             page_full = len(edges) >= PAGE_SIZE
-            for edge in edges:
+            sorted_edges = sorted(
+                edges,
+                key=lambda e: (e.get("node") or {}).get("taken_at") or 0,
+                reverse=True,
+            )
+            for edge in sorted_edges:
                 node = edge.get("node") or {}
                 taken_at = node.get("taken_at") or 0
                 if date_floor is not None and taken_at < date_floor:
@@ -819,8 +825,12 @@ async def instagram(req: InstagramRequest):
                     )
                     nedges = _extract_edges(nresult["body"])
                     npage_full = len(nedges) >= PAGE_SIZE
-
-                    for edge in nedges:
+                    nsorted = sorted(
+                        nedges,
+                        key=lambda e: (e.get("node") or {}).get("taken_at") or 0,
+                        reverse=True,
+                    )
+                    for edge in nsorted:
                         node = edge.get("node") or {}
                         taken_at = node.get("taken_at") or 0
                         if date_floor is not None and taken_at < date_floor:

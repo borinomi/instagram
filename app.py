@@ -1,26 +1,30 @@
 import asyncio
 import json
 import os
-import socket
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 from urllib.parse import parse_qs
-
+from fastapi.responses import Response
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
+from camoufox.async_api import AsyncCamoufox
 
-try:
-    from playwright_stealth import stealth_async
-    STEALTH_MODE = "legacy"
-except ImportError:
-    from playwright_stealth import Stealth
-    STEALTH_MODE = "context"
+# ───────────────────────────── Config ─────────────────────────────
 
-CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
-CDP_HOST = os.getenv("CDP_HOST", socket.gethostbyname("host.docker.internal"))
+CAMOUFOX_HEADLESS = os.getenv("CAMOUFOX_HEADLESS", "virtual")  # virtual | true | false
+CAMOUFOX_OS = os.getenv("CAMOUFOX_OS", "windows")
+CAMOUFOX_LOCALE = os.getenv("CAMOUFOX_LOCALE", "en-US")
+CAMOUFOX_HUMANIZE = os.getenv("CAMOUFOX_HUMANIZE", "true").lower() == "true"
+CAMOUFOX_PROFILE_DIR = os.getenv("CAMOUFOX_PROFILE_DIR", "/app/camoufox-profile")
+
+if CAMOUFOX_HEADLESS == "true":
+    HEADLESS_VAL = True
+elif CAMOUFOX_HEADLESS == "false":
+    HEADLESS_VAL = False
+else:
+    HEADLESS_VAL = "virtual"
 
 
 def now_iso():
@@ -37,33 +41,31 @@ class ProfilePostsNextRequest(BaseModel):
     after: str
     username: Optional[str] = None
 
+
 class CommentRequest(BaseModel):
-    pk: str                              # 게시물 media id
-    code: Optional[str] = None           # 게시물 shortcode (referrer 용, 없어도 됨)
-    max_loops: int = 50                  # 안전장치
+    pk: str
+    code: Optional[str] = None
+    max_loops: int = 50
+
 
 class ProfileRequest(BaseModel):
-    url: Optional[str] = None        # https://www.instagram.com/lg_uk/
-    id: Optional[str] = None         # user_id (50918045). 있으면 페이지 이동 생략 가능
-    username: Optional[str] = None   # 디버깅/로깅용
+    url: Optional[str] = None
+    id: Optional[str] = None
+    username: Optional[str] = None
 
 
-# ───────────────────────────── Stealth ─────────────────────────────
+class InjectCookieRequest(BaseModel):
+    cookie_string: str
+    domain: str
+    path: str = "/"
+    secure: bool = True
 
-async def create_stealth_page(context):
-    if STEALTH_MODE == "legacy":
-        page = await context.new_page()
-        await stealth_async(page)
-        return page
-    stealth = Stealth()
-    await stealth.apply_stealth_async(context)
-    return await context.new_page()
-
+class InstagramRequest(BaseModel):
+    username: str
+    count: Optional[int] = None
+    date: Optional[str] = None
 
 # ───────────────────────────── Query Cache ─────────────────────────────
-#
-# 페이지가 실제로 날리는 GraphQL 요청을 가로채서
-# friendly_name → {doc_id, root_field} 매핑을 저장.
 
 QUERY_CACHE: dict[str, dict] = {}
 
@@ -81,8 +83,8 @@ def _harvest_request(req):
         post_data = req.post_data or ""
         parsed = parse_qs(post_data)
         doc_id = (parsed.get("doc_id") or [None])[0]
-        variables_raw = (parsed.get("variables") or [None])[0]  # ← 추가
-        
+        variables_raw = (parsed.get("variables") or [None])[0]
+
         if not friendly:
             friendly = (parsed.get("fb_api_req_friendly_name") or [None])[0]
 
@@ -93,7 +95,7 @@ def _harvest_request(req):
                 "doc_id": doc_id,
                 "root_field": root_field or "",
                 "endpoint": endpoint,
-                "variables_raw": variables_raw,  # ← 추가
+                "variables_raw": variables_raw,
             }
             print(f"[harvest] {friendly} → doc_id={doc_id} ep={endpoint} root_field={root_field}")
     except Exception as e:
@@ -102,12 +104,25 @@ def _harvest_request(req):
 
 # ───────────────────────────── Lifespan ─────────────────────────────
 
+async def _launch_camoufox():
+    cam = AsyncCamoufox(
+        headless=HEADLESS_VAL,
+        os=CAMOUFOX_OS,
+        locale=CAMOUFOX_LOCALE,
+        humanize=CAMOUFOX_HUMANIZE,
+        persistent_context=True,
+        user_data_dir=CAMOUFOX_PROFILE_DIR,
+        geoip=True,
+    )
+    browser = await cam.__aenter__()
+    return cam, browser
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    playwright = await async_playwright().start()
-    app.state.playwright = playwright
+    os.makedirs(CAMOUFOX_PROFILE_DIR, exist_ok=True)
+    app.state.cam = None
     app.state.browser = None
-    app.state.context = None
     app.state.page = None
     app.state.lock = asyncio.Lock()
     try:
@@ -119,7 +134,11 @@ async def lifespan(app: FastAPI):
                 await page.close()
         except Exception:
             pass
-        await playwright.stop()
+        try:
+            if app.state.cam:
+                await app.state.cam.__aexit__(None, None, None)
+        except Exception:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -137,26 +156,40 @@ async def connect_browser():
         except Exception:
             pass
 
-    browser = await app.state.playwright.chromium.connect_over_cdp(
-        f"http://{CDP_HOST}:{CDP_PORT}"
-    )
-    if not browser.contexts:
-        raise RuntimeError("browser context not found")
+    # 브라우저가 죽었거나 처음 시작
+    if app.state.cam is None or app.state.browser is None:
+        app.state.cam, app.state.browser = await _launch_camoufox()
 
-    context = browser.contexts[0]
-    page = await create_stealth_page(context)
+    # persistent_context 모드에서는 browser 자체가 context
+    context = app.state.browser
 
-    # GraphQL 요청 가로채기
+    # 기존 페이지 재사용 or 새로 생성
+    if context.pages:
+        page = context.pages[0]
+    else:
+        page = await context.new_page()
+
     page.on("request", _harvest_request)
 
-    app.state.browser = browser
-    app.state.context = context
     app.state.page = page
     return page
 
 
 async def ensure_page():
-    return await connect_browser()
+    try:
+        return await connect_browser()
+    except Exception as e:
+        print(f"[ensure_page] reconnect after error: {e}")
+        # 브라우저 죽었으면 정리하고 재시작
+        try:
+            if app.state.cam:
+                await app.state.cam.__aexit__(None, None, None)
+        except Exception:
+            pass
+        app.state.cam = None
+        app.state.browser = None
+        app.state.page = None
+        return await connect_browser()
 
 
 # ───────────────────────────── Username 추출 ─────────────────────────────
@@ -181,7 +214,6 @@ def find_query(kind: str) -> Optional[dict]:
 
 
 async def wait_for_query(kind: str, timeout: float = 10.0) -> dict:
-    """캐시에 해당 kind 쿼리가 들어올 때까지 대기."""
     interval = 0.2
     waited = 0.0
     while waited < timeout:
@@ -313,7 +345,6 @@ async ({ pk, max_loops }) => {
     while (loops < max_loops) {
         let url = base + "?can_support_threading=true";
         if (minId) {
-            // next_min_id 에서 bifilter_token 만 빼서 재포장
             let token = null;
             try {
                 token = JSON.parse(minId).bifilter_token;
@@ -380,19 +411,15 @@ async ({ pk, max_loops }) => {
 async def fetch_comments(page, pk: str, max_loops: int):
     return await page.evaluate(COMMENTS_JS, {"pk": pk, "max_loops": max_loops})
 
+
 USER_ID_JS = """
 ({ username }) => {
     const html = document.documentElement.innerHTML;
-    // 여러 패턴 시도 — 인스타 페이지 빌드마다 위치가 다를 수 있음
     const patterns = [
-        // "profilePage_50918045" 같은 형태
         new RegExp('"profilePage_(\\\\d+)"'),
-        // "owner":{"id":"50918045", ... ,"username":"lg_uk"}
         new RegExp('"username":"' + username + '"[^}]{0,200}?"id":"(\\\\d+)"'),
         new RegExp('"id":"(\\\\d+)"[^}]{0,200}?"username":"' + username + '"'),
-        // "user_id":"50918045"
         /"user_id":"(\\d+)"/,
-        // "owner_id":"50918045"
         /"owner_id":"(\\d+)"/
     ];
     for (const r of patterns) {
@@ -408,16 +435,41 @@ async def extract_user_id(page, username: str) -> Optional[str]:
     return await page.evaluate(USER_ID_JS, {"username": username})
 
 
-
 # ───────────────────────────── Endpoints ─────────────────────────────
+
+@app.post("/inject_cookie")
+async def inject_cookie(req: InjectCookieRequest):
+    try:
+        domain = req.domain.strip().rstrip("/")
+        cookies = []
+        for pair in req.cookie_string.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": domain,
+                "path": req.path,
+                "secure": req.secure,
+                "sameSite": "Lax",
+            })
+        async with app.state.lock:
+            page = await ensure_page()
+            await page.context.add_cookies(cookies)
+            return {"success": True, "count": len(cookies), "domain": domain, "timestamp": now_iso()}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"success": False, "error": str(e), "timestamp": now_iso()}
+
 
 @app.post("/fetch-new")
 async def fetch_new(req: ProfilePostsRequest):
     try:
         username = extract_username(req.url)
         if not username:
-            return {"success": False, "error": "username parse failed",
-                    "timestamp": now_iso()}
+            return {"success": False, "error": "username parse failed", "timestamp": now_iso()}
 
         async with app.state.lock:
             page = await ensure_page()
@@ -428,13 +480,10 @@ async def fetch_new(req: ProfilePostsRequest):
 
             meta = await wait_for_query("first", timeout=10)
 
-            # 인스타가 실제로 보낸 variables를 그대로 사용
             if meta.get("variables_raw"):
                 variables = json.loads(meta["variables_raw"])
-                # username만 우리가 원하는 걸로 덮어쓰기 (다른 계정 조회용)
                 variables["username"] = username
             else:
-                # 폴백
                 variables = {
                     "data": {
                         "count": 12,
@@ -459,7 +508,7 @@ async def fetch_new(req: ProfilePostsRequest):
 
             print(f"[fetch-new][{username}] status={result['status']} "
                   f"meta={meta['friendly_name']} len={len(result['body'])}")
-            
+
             return {
                 "success": True,
                 "status": result["status"],
@@ -470,6 +519,7 @@ async def fetch_new(req: ProfilePostsRequest):
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"success": False, "error": str(e), "timestamp": now_iso()}
+
 
 @app.post("/fetch-next")
 async def fetch_next(req: ProfilePostsNextRequest):
@@ -482,23 +532,18 @@ async def fetch_next(req: ProfilePostsNextRequest):
                 return {"success": False, "error": "username not provided and parse failed",
                         "timestamp": now_iso()}
 
-            # next 쿼리 메타가 아직 캐시에 없으면 스크롤로 트리거
             if not find_query("next"):
                 print("[fetch-next] next query not cached yet → trigger by scroll")
-                await page.evaluate(
-                    "window.scrollTo(0, document.body.scrollHeight)"
-                )
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(2)
 
             meta = await wait_for_query("next", timeout=10)
 
-            # 캐시된 variables 그대로 사용, after와 username만 덮어쓰기
             if meta.get("variables_raw"):
                 variables = json.loads(meta["variables_raw"])
                 variables["after"] = req.after
                 variables["username"] = username
             else:
-                # 폴백
                 variables = {
                     "after": req.after,
                     "before": None,
@@ -541,21 +586,19 @@ async def fetch_next(req: ProfilePostsNextRequest):
 async def debug_cache():
     return {"cache": QUERY_CACHE, "timestamp": now_iso()}
 
+
 @app.post("/comment")
 async def comment(req: CommentRequest):
     try:
         async with app.state.lock:
             page = await ensure_page()
 
-            # referrer 페이지로 이동 (쿠키/세션 컨텍스트 확보)
             if req.code:
                 target = f"https://www.instagram.com/p/{req.code}/"
                 if req.code not in page.url:
                     await page.goto(target, wait_until="domcontentloaded")
                     await asyncio.sleep(1.5)
             else:
-                # code 가 없으면 현재 페이지 컨텍스트 그대로 사용
-                # (인스타 도메인 페이지에 한 번이라도 들어와 있어야 쿠키/토큰 추출 가능)
                 if "instagram.com" not in (page.url or ""):
                     await page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
                     await asyncio.sleep(1.5)
@@ -576,6 +619,7 @@ async def comment(req: CommentRequest):
     except Exception as e:
         import traceback; traceback.print_exc()
         return {"success": False, "error": str(e), "timestamp": now_iso()}
+
 
 @app.post("/profile")
 async def profile(req: ProfileRequest):
@@ -611,12 +655,10 @@ async def profile(req: ProfileRequest):
 
             meta = await wait_for_query("profile", timeout=10)
 
-            # 캐시된 variables 그대로 사용, id만 덮어쓰기
             if meta.get("variables_raw"):
                 variables = json.loads(meta["variables_raw"])
                 variables["id"] = user_id
             else:
-                # 폴백
                 variables = {
                     "enable_integrity_filters": True,
                     "id": user_id,
@@ -647,6 +689,195 @@ async def profile(req: ProfileRequest):
         import traceback; traceback.print_exc()
         return {"success": False, "error": str(e), "timestamp": now_iso()}
 
+EDGES_PATH = "xdt_api__v1__feed__user_timeline_graphql_connection"
+PAGE_SIZE = 12
+
+
+def _parse_date_floor(date_str: str) -> int:
+    """'YYYY-MM-DD' → 당일 00:00:00 로컬 기준 unix timestamp(초). 당일 포함(>=)."""
+    dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+    return int(dt.timestamp())
+
+
+def _extract_edges(body_str: str) -> list:
+    """run_graphql 의 body(JSON 문자열) → edges 리스트."""
+    try:
+        parsed = json.loads(body_str)
+    except Exception:
+        return []
+    conn = (parsed.get("data") or {}).get(EDGES_PATH) or {}
+    return conn.get("edges") or []
+
+
+@app.post("/instagram")
+async def instagram(req: InstagramRequest):
+    try:
+        username = req.username.strip().strip("/")
+        if not username:
+            return {"success": False, "error": "username required", "timestamp": now_iso()}
+
+        date_floor = _parse_date_floor(req.date) if req.date else None
+        profile_url = f"https://www.instagram.com/{username}/"
+
+        collected: list = []
+        stop_reason = "exhausted"
+        date_hit = False
+
+        async with app.state.lock:
+            page = await ensure_page()
+
+            # ── 프로필 페이지 진입 ──
+            if username not in (page.url or ""):
+                await page.goto(profile_url, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+
+            # ── 1) fetch-new (첫 페이지) ──
+            meta = await wait_for_query("first", timeout=10)
+            if meta.get("variables_raw"):
+                variables = json.loads(meta["variables_raw"])
+                variables["username"] = username
+            else:
+                variables = {
+                    "data": {
+                        "count": PAGE_SIZE,
+                        "include_reel_media_seen_timestamp": True,
+                        "include_relationship_info": True,
+                        "latest_besties_reel_media": True,
+                        "latest_reel_media": True,
+                    },
+                    "username": username,
+                    "__relay_internal__pv__PolarisImmersiveFeedChainingEnabledrelayprovider": True,
+                    "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
+                    "__relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider": False,
+                }
+
+            result = await run_graphql(
+                page,
+                friendly_name=meta["friendly_name"],
+                doc_id=meta["doc_id"],
+                root_field=meta["root_field"],
+                variables=variables,
+            )
+            edges = _extract_edges(result["body"])
+
+            # 첫 페이지 처리
+            page_full = len(edges) >= PAGE_SIZE
+            for edge in edges:
+                node = edge.get("node") or {}
+                taken_at = node.get("taken_at") or 0
+                if date_floor is not None and taken_at < date_floor:
+                    date_hit = True
+                    break
+                collected.append(edge)
+                if req.count is not None and len(collected) >= req.count:
+                    break
+
+            # 종료 판단
+            if date_hit:
+                stop_reason = "date_boundary"
+            elif req.count is not None and len(collected) >= req.count:
+                stop_reason = "count_reached"
+            elif not page_full:
+                stop_reason = "exhausted"
+            else:
+                # ── 2) fetch-next 반복 ──
+                after = edges[-1]["node"]["id"]
+
+                while True:
+                    if not find_query("next"):
+                        print("[instagram] next query not cached yet → trigger by scroll")
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2)
+
+                    nmeta = await wait_for_query("next", timeout=10)
+                    if nmeta.get("variables_raw"):
+                        nvars = json.loads(nmeta["variables_raw"])
+                        nvars["after"] = after
+                        nvars["username"] = username
+                    else:
+                        nvars = {
+                            "after": after,
+                            "before": None,
+                            "data": {
+                                "count": PAGE_SIZE,
+                                "include_reel_media_seen_timestamp": True,
+                                "include_relationship_info": True,
+                                "latest_besties_reel_media": True,
+                                "latest_reel_media": True,
+                            },
+                            "first": PAGE_SIZE,
+                            "last": None,
+                            "username": username,
+                        }
+
+                    nresult = await run_graphql(
+                        page,
+                        friendly_name=nmeta["friendly_name"],
+                        doc_id=nmeta["doc_id"],
+                        root_field=nmeta["root_field"],
+                        variables=nvars,
+                    )
+                    nedges = _extract_edges(nresult["body"])
+                    npage_full = len(nedges) >= PAGE_SIZE
+
+                    for edge in nedges:
+                        node = edge.get("node") or {}
+                        taken_at = node.get("taken_at") or 0
+                        if date_floor is not None and taken_at < date_floor:
+                            date_hit = True
+                            break
+                        collected.append(edge)
+                        if req.count is not None and len(collected) >= req.count:
+                            break
+
+                    if date_hit:
+                        stop_reason = "date_boundary"
+                        break
+                    if req.count is not None and len(collected) >= req.count:
+                        stop_reason = "count_reached"
+                        break
+                    if not npage_full:
+                        stop_reason = "exhausted"
+                        break
+                    if not nedges:
+                        stop_reason = "exhausted"
+                        break
+
+                    after = nedges[-1]["node"]["id"]
+
+        # ── 최종 자르기 (count 상한) ──
+        if req.count is not None:
+            collected = collected[:req.count]
+
+        print(f"[instagram][{username}] count={len(collected)} "
+              f"stop={stop_reason} date={req.date} req_count={req.count}")
+
+        return {
+            "success": True,
+            "username": username,
+            "count": len(collected),
+            "stop_reason": stop_reason,
+            "date": req.date,
+            "data": collected,
+            "timestamp": now_iso(),
+        }
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"success": False, "error": str(e), "timestamp": now_iso()}
+
+
+@app.get("/debug/screenshot")
+async def debug_screenshot():
+    async with app.state.lock:
+        page = await ensure_page()
+        png = await page.screenshot(full_page=False)
+        return Response(content=png, media_type="image/png")
+
+@app.get("/debug/url")
+async def debug_url():
+    async with app.state.lock:
+        page = await ensure_page()
+        return {"url": page.url, "title": await page.title()}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8026)

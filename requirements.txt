@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 pydantic
-playwright
-playwright-stealth
+camoufox[geoip]
+playwright==1.59.0

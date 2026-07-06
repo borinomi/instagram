@@ -1,14 +1,23 @@
 services:
-  fetch-api:
+  instagram-api:
     build: .
     restart: always
     #network_mode: "host"
     ports:
       - "8026:8026"
-    volumes:
-      - ./fetch:/app/data/
     #env_file:
     #  - .env
     environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONIOENCODING=UTF-8
+      - CAMOUFOX_HEADLESS=virtual
+      - CAMOUFOX_OS=windows
+      - CAMOUFOX_LOCALE=en-US
+      - CAMOUFOX_HUMANIZE=true
+      - CAMOUFOX_GEOIP=false
+      - CAMOUFOX_PERSISTENT=true
+      - CAMOUFOX_USER_DATA_DIR=/app/camoufox-profile
+
+    volumes:
+      - camoufox-profile:/app/camoufox-profile
+
+volumes:
+  camoufox-profile:

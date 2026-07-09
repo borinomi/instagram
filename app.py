@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -441,6 +442,7 @@ async def extract_user_id(page, username: str) -> Optional[str]:
 async def inject_cookie(req: InjectCookieRequest):
     try:
         domain = req.domain.strip().rstrip("/")
+        expires_at = int(time.time()) + 60 * 60 * 24 * 365  # 1년
         cookies = []
         for pair in req.cookie_string.split(";"):
             pair = pair.strip()
@@ -454,6 +456,7 @@ async def inject_cookie(req: InjectCookieRequest):
                 "path": req.path,
                 "secure": req.secure,
                 "sameSite": "Lax",
+                "expires": expires_at,
             })
         async with app.state.lock:
             page = await ensure_page()
@@ -585,6 +588,23 @@ async def fetch_next(req: ProfilePostsNextRequest):
 @app.get("/debug/cache")
 async def debug_cache():
     return {"cache": QUERY_CACHE, "timestamp": now_iso()}
+
+@app.get("/debug/cookies")
+async def debug_cookies():
+    async with app.state.lock:
+        page = await ensure_page()
+        cookies = await page.context.cookies()
+        # 민감하니까 이름과 존재 여부, 만료만 확인
+        summary = []
+        for c in cookies:
+            if c["name"] in ("sessionid", "ds_user_id", "csrftoken", "rur", "mid"):
+                summary.append({
+                    "name": c["name"],
+                    "has_value": bool(c.get("value")),
+                    "expires": c.get("expires"),
+                    "domain": c.get("domain"),
+                })
+        return {"instagram_cookies": summary, "total": len(cookies), "timestamp": now_iso()}
 
 
 @app.post("/comment")
